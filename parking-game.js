@@ -90,11 +90,22 @@ class ParkingGame {
     this.collisionFlashDurationMs = 120;
     this.collisionFlashUntilMs = 0;
 
+    // Bounce-back after collision
+    this.collisionBounceSpeed = 220; // px/s initial impulse
+    this.collisionBounceDurationMs = 140; // duration of impulse
+    this.collisionBounceUntilMs = 0; // timestamp when impulse ends
+    this.collisionBounceDir = { x: 0, y: 0 }; // unit vector away from collision
+    this.collisionMTV = null; // minimal translation vector from last collision
+
     // Debug
     this.debug = false;
     this.lastCollision = null;
 
     // Turning arc draws from front center near the arrow
+    // Guide fade radius (controls visible extent of turning guides)
+    this.turningGuideFadeRadius = 220;
+    // Visual steering wheel: real wheel rotates more than tire angle; multiplier maps tire steer to wheel rotation
+    this.steeringWheelRatio = 15; // ~30° tire angle → ~450° wheel rotation
 
     // Set initial player car position, speed, and steer
     this.setInitialCarPosition();
@@ -111,6 +122,7 @@ class ParkingGame {
       grass: null, // pattern for grass area
       blueCar: null, // image for player
       orangeCar: null, // image for parked cars
+      wheel: null, // image for steering HUD
     };
     this.loadTextures();
 
@@ -208,6 +220,7 @@ class ParkingGame {
 
     this.textures.blueCar = loadImg("blue-car.webp");
     this.textures.orangeCar = loadImg("orange-car.webp");
+    this.textures.wheel = loadImg("wheel.webp");
   }
 
   setInitialCarPosition() {
@@ -384,13 +397,51 @@ class ParkingGame {
       this.car.speed = 0;
       this.car.collided = true;
       this.collisionFlashUntilMs = Date.now() + this.collisionFlashDurationMs;
+      // Setup bounce impulse
+      const now = Date.now();
+      const mtv = this.collisionMTV;
+      if (mtv) {
+        const len = Math.hypot(mtv.x, mtv.y) || 1;
+        // Push away from the collision (opposite the MTV direction)
+        this.collisionBounceDir = { x: -mtv.x / len, y: -mtv.y / len };
+      } else {
+        this.collisionBounceDir = {
+          x: -Math.cos(this.car.angle),
+          y: -Math.sin(this.car.angle),
+        };
+      }
+      this.collisionBounceUntilMs = now + this.collisionBounceDurationMs;
     } else {
       this.car.collided = false;
     }
 
-    // Keep car within canvas bounds
-    this.car.x = Math.max(45, Math.min(this.canvas.width - 45, this.car.x));
+    // Horizontal wrap and vertical clamp
+    const halfW = this.car.width / 2;
+    if (this.car.x < -halfW) {
+      this.car.x = this.canvas.width + halfW;
+    } else if (this.car.x > this.canvas.width + halfW) {
+      this.car.x = -halfW;
+    }
     this.car.y = Math.max(45, Math.min(this.canvas.height - 45, this.car.y));
+
+    // Apply bounce-back impulse if active (ease-out)
+    const now = Date.now();
+    if (now < this.collisionBounceUntilMs) {
+      const remaining = this.collisionBounceUntilMs - now;
+      const t = Math.max(
+        0,
+        Math.min(1, remaining / this.collisionBounceDurationMs)
+      );
+      const scale = t * t; // quadratic ease-out
+      const v = this.collisionBounceSpeed * scale * dtSeconds;
+      this.car.x += this.collisionBounceDir.x * v;
+      this.car.y += this.collisionBounceDir.y * v;
+      // Keep within bounds after impulse
+      const halfW2 = this.car.width / 2;
+      if (this.car.x < -halfW2) this.car.x = this.canvas.width + halfW2;
+      if (this.car.x > this.canvas.width + halfW2) this.car.x = -halfW2;
+      this.car.y = Math.max(45, Math.min(this.canvas.height - 45, this.car.y));
+    }
   }
 
   getMousePos(evt) {
@@ -442,8 +493,10 @@ class ParkingGame {
         parkedCar.collisionInsetX || 0,
         parkedCar.collisionInsetY || 0
       );
-      if (this.polygonCollision(playerPoly, npcPoly)) {
+      const result = this.polygonCollisionMTV(playerPoly, npcPoly);
+      if (result.collides) {
         this.lastCollision = { type: "car", with: parkedCar };
+        this.collisionMTV = result.mtv;
         return true;
       }
     }
@@ -463,9 +516,13 @@ class ParkingGame {
       curb.height,
       curb.angle
     );
-    if (this.polygonCollision(playerPoly, curbPoly)) {
-      this.lastCollision = { type: "curb", with: curb };
-      return true;
+    {
+      const result = this.polygonCollisionMTV(playerPoly, curbPoly);
+      if (result.collides) {
+        this.lastCollision = { type: "curb", with: curb };
+        this.collisionMTV = result.mtv;
+        return true;
+      }
     }
 
     return false;
@@ -579,6 +636,48 @@ class ParkingGame {
     return true;
   }
 
+  // Compute Minimal Translation Vector (MTV) using SAT to know push-out direction/amount
+  polygonCollisionMTV(pointsA, pointsB) {
+    let smallestOverlap = Infinity;
+    let separatingAxis = null;
+    const axes = [...this.getAxes(pointsA), ...this.getAxes(pointsB)];
+    const centerA = this.getPolygonCenter(pointsA);
+    const centerB = this.getPolygonCenter(pointsB);
+    for (const axis of axes) {
+      const [minA, maxA] = this.projectPointsOnAxis(pointsA, axis);
+      const [minB, maxB] = this.projectPointsOnAxis(pointsB, axis);
+      const overlap = Math.min(maxA, maxB) - Math.max(minA, minB);
+      if (overlap <= 0) return { collides: false };
+      if (overlap < smallestOverlap) {
+        smallestOverlap = overlap;
+        // Make axis point from A to B so MTV pushes A out of B
+        const delta = { x: centerB.x - centerA.x, y: centerB.y - centerA.y };
+        const sign = delta.x * axis.x + delta.y * axis.y < 0 ? -1 : 1;
+        separatingAxis = { x: axis.x * sign, y: axis.y * sign };
+      }
+    }
+    return {
+      collides: true,
+      mtv: separatingAxis
+        ? {
+            x: separatingAxis.x * smallestOverlap,
+            y: separatingAxis.y * smallestOverlap,
+          }
+        : { x: 0, y: 0 },
+    };
+  }
+
+  getPolygonCenter(points) {
+    let sx = 0;
+    let sy = 0;
+    for (const p of points) {
+      sx += p.x;
+      sy += p.y;
+    }
+    const inv = 1 / Math.max(points.length, 1);
+    return { x: sx * inv, y: sy * inv };
+  }
+
   pointInPolygon(px, py, points) {
     let inside = false;
     for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
@@ -653,7 +752,40 @@ class ParkingGame {
 
   drawTurningArc() {
     const radius = this.getTurningRadius();
-    if (!radius || Math.abs(this.car.steerAngle) < 0.01) return;
+    if (!radius || Math.abs(this.car.steerAngle) < 0.01) {
+      const halfW = this.car.width / 2;
+      const anchorOffset = halfW - 8;
+      const anchorX = this.car.x + Math.cos(this.car.angle) * anchorOffset;
+      const anchorY = this.car.y + Math.sin(this.car.angle) * anchorOffset;
+
+      const straightHalfLen = this.turningGuideFadeRadius; // half-length in px on each side
+
+      // Fade based on distance from the anchor point (near car is opaque)
+      const fadeR = this.turningGuideFadeRadius;
+      const grad = this.ctx.createRadialGradient(
+        this.car.x,
+        this.car.y,
+        0,
+        this.car.x,
+        this.car.y,
+        fadeR
+      );
+      grad.addColorStop(0.0, "rgba(74, 222, 128, 1.0)");
+      grad.addColorStop(0.6, "rgba(74, 222, 128, 0.25)");
+      grad.addColorStop(1.0, "rgba(74, 222, 128, 0.0)");
+
+      this.ctx.strokeStyle = grad;
+      this.ctx.lineWidth = this.car.width / 2.4;
+      this.ctx.setLineDash([5, 5]);
+      this.ctx.beginPath();
+      const dx = Math.cos(this.car.angle) * straightHalfLen;
+      const dy = Math.sin(this.car.angle) * straightHalfLen;
+      this.ctx.moveTo(anchorX - dx, anchorY - dy);
+      this.ctx.lineTo(anchorX + dx, anchorY + dy);
+      this.ctx.stroke();
+      this.ctx.setLineDash([]);
+      return;
+    }
 
     // Anchor near the arrow at the front center of the car
     const halfW = this.car.width / 2;
@@ -661,34 +793,41 @@ class ParkingGame {
     const anchorX = this.car.x + Math.cos(this.car.angle) * anchorOffset;
     const anchorY = this.car.y + Math.sin(this.car.angle) * anchorOffset;
 
-    // Calculate arc center using perpendicular from the anchor point
+    // Calculate turning circle for the ANCHOR point, not the rear axle.
+    // Bicycle model: R_rear = wheelbase / tan(delta). Any point s meters ahead of rear axle
+    // travels a circle of radius R_point = sqrt(R_rear^2 + s^2).
+    const sFromRearToCenter = this.car.wheelbase / 2;
+    const sFromCenterToAnchor = anchorOffset;
+    const sFromRearToAnchor = sFromRearToCenter + sFromCenterToAnchor;
+    const anchorRadius = Math.hypot(radius, sFromRearToAnchor);
+
+    // Arc center using perpendicular from the anchor by the anchor's radius
     const perpAngle =
       this.car.angle + (this.car.steerAngle > 0 ? Math.PI / 2 : -Math.PI / 2);
-    const centerX = anchorX + Math.cos(perpAngle) * radius;
-    const centerY = anchorY + Math.sin(perpAngle) * radius;
+    const centerX = anchorX + Math.cos(perpAngle) * anchorRadius;
+    const centerY = anchorY + Math.sin(perpAngle) * anchorRadius;
 
-    // Draw arc
-    this.ctx.strokeStyle = "#4ade80";
-    this.ctx.lineWidth = 2;
+    // Draw a full circle, but fade so only the segment near the car is visible
+
+    // Radial gradient centered at the car's front; farther pixels fade out
+    const fadeR = this.turningGuideFadeRadius; // fade radius in px around the car center
+    const grad = this.ctx.createRadialGradient(
+      this.car.x,
+      this.car.y,
+      0,
+      this.car.x,
+      this.car.y,
+      fadeR
+    );
+    grad.addColorStop(0.0, "rgba(74, 222, 128, 1.0)");
+    grad.addColorStop(0.6, "rgba(74, 222, 128, 0.25)");
+    grad.addColorStop(1.0, "rgba(74, 222, 128, 0.0)");
+
+    this.ctx.strokeStyle = grad;
+    this.ctx.lineWidth = this.car.width / 2.4;
     this.ctx.setLineDash([5, 5]);
     this.ctx.beginPath();
-
-    const startAngle =
-      this.car.angle + (this.car.steerAngle > 0 ? -Math.PI / 2 : Math.PI / 2);
-    const arcLength = Math.PI / 3;
-
-    const ccw =
-      (this.car.steerAngle > 0 && this.car.lastDirection < 0) ||
-      (this.car.steerAngle < 0 && this.car.lastDirection > 0);
-
-    this.ctx.arc(
-      centerX,
-      centerY,
-      radius,
-      startAngle,
-      startAngle + (ccw ? arcLength : -arcLength),
-      ccw
-    );
+    this.ctx.arc(centerX, centerY, anchorRadius, 0, Math.PI * 2);
     this.ctx.stroke();
     this.ctx.setLineDash([]);
   }
@@ -801,6 +940,45 @@ class ParkingGame {
     this.ctx.restore();
   }
 
+  drawSteeringHUD() {
+    const margin = 4;
+    const hudWidth = 70;
+    const hudHeight = 20;
+    const imgSize = 128;
+    const cx = this.canvas.width / 2;
+    const cy = this.canvas.height - margin - imgSize / 2;
+
+    // Rotating wheel (texture if available, else rectangle fallback)
+    const wheelAngle = this.car.steerAngle * (this.steeringWheelRatio || 1);
+    this.ctx.save();
+    this.ctx.translate(cx, cy);
+    this.ctx.rotate(wheelAngle);
+    const wheelImg = this.textures.wheel;
+    if (wheelImg && wheelImg.complete) {
+      this.ctx.drawImage(
+        wheelImg,
+        -imgSize / 2,
+        -imgSize / 2,
+        imgSize,
+        imgSize
+      );
+    } else {
+      this.ctx.fillStyle = "#303030";
+      this.ctx.strokeStyle = "#aaa";
+      this.ctx.lineWidth = 2;
+      this.ctx.fillRect(-hudWidth / 2, -hudHeight / 2, hudWidth, hudHeight);
+      this.ctx.strokeRect(-hudWidth / 2, -hudHeight / 2, hudWidth, hudHeight);
+      // Center marker line
+      this.ctx.strokeStyle = "#4ade80";
+      this.ctx.lineWidth = 2;
+      this.ctx.beginPath();
+      this.ctx.moveTo(-hudWidth / 2 + 6, 0);
+      this.ctx.lineTo(hudWidth / 2 - 6, 0);
+      this.ctx.stroke();
+    }
+    this.ctx.restore();
+  }
+
   checkParking() {
     const inSpace =
       this.car.x > this.parkingSpace.x - this.parkingSpace.width / 2 &&
@@ -887,26 +1065,13 @@ class ParkingGame {
       this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     }
 
-    // Draw speed indicator
-    this.ctx.fillStyle = this.car.collided ? "#ff4444" : "#fff";
     this.ctx.font = "16px Arial";
-    this.ctx.textAlign = "left";
-    this.ctx.fillText(`Speed: ${Math.abs(this.car.speed).toFixed(1)}`, 10, 30);
-    this.ctx.fillText(
-      `Steering: ${((this.car.steerAngle * 180) / Math.PI).toFixed(0)}°`,
-      10,
-      50
-    );
-
     // Level counter (based on winCount; starts at 1)
     this.ctx.fillStyle = "#fff";
     this.ctx.textAlign = "center";
     this.ctx.fillText(`Level: ${this.winCount + 1}`, this.canvas.width / 2, 24);
 
-    if (this.car.collided) {
-      this.ctx.fillStyle = "#ff4444";
-      this.ctx.fillText("COLLISION!", 10, 70);
-    }
+    // Removed explicit COLLISION text; color cues and flash overlay remain
 
     // Collision flash overlay
     if (Date.now() < this.collisionFlashUntilMs) {
@@ -968,6 +1133,9 @@ class ParkingGame {
         90
       );
     }
+
+    // Steering HUD (always on)
+    this.drawSteeringHUD();
   }
 
   drawBackground() {
