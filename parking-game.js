@@ -15,12 +15,13 @@ class ParkingGame {
       height: 45,
       angle: 0,
       speed: 0,
-      maxSpeed: 3,
-      acceleration: 0.2,
-      friction: 0.1,
+      maxSpeed: 360, // pixels per second
+      acceleration: 100, // pixels per second^2
+      friction: 300, // pixels per second^2
       steerAngle: 0,
       maxSteerAngle: Math.PI / 6,
       wheelbase: 70,
+      steerChangeRate: 0.8, // radians per second
       collided: false,
       lastDirection: 1, // 1 for forward, -1 for reverse
     };
@@ -64,7 +65,7 @@ class ParkingGame {
     this.gapStep = 20;
     this.winCount = 0;
     this.winLatched = false;
-    this.curbWidth = 400;
+    this.curbWidth = this.canvas.width;
     this.curbHeight = 30;
     this.curbOffsetY = 160; // distance below parking space center
     this.laneGapFromCurb = 10; // vertical gap above curb for parked cars/space
@@ -77,6 +78,10 @@ class ParkingGame {
     // Win/reset timing state
     this.winResetDelayMs = 1200;
     this.winResetAtMs = null;
+
+    // Collision flash state
+    this.collisionFlashDurationMs = 120;
+    this.collisionFlashUntilMs = 0;
 
     // Debug
     this.debug = false;
@@ -91,7 +96,22 @@ class ParkingGame {
     this.initUI();
     this.recomputeParkingLayout();
 
+    // Textures
+    this.textures = {
+      asphalt: null, // pattern
+      tiles: null, // legacy; not used after switching to exact-height sidewalk
+      sidewalkImg: null, // raw image for curb tiling
+      grass: null, // pattern for grass area
+      blueCar: null, // image for player
+      orangeCar: null, // image for parked cars
+    };
+    this.loadTextures();
+
+    // Sprite orientation offset (source cars face down; game faces right)
+    this.spriteAngleOffset = -Math.PI / 2;
+
     this.setupEventListeners();
+    this.lastFrameAtMs = null;
     this.gameLoop();
   }
 
@@ -158,6 +178,29 @@ class ParkingGame {
       this.gapLabel.textContent = `Gap: ${Math.round(this.gapBetweenCars)} px`;
     if (this.gapSlider)
       this.gapSlider.value = String(Math.round(this.gapBetweenCars));
+  }
+
+  loadTextures() {
+    // Helper to load an image and optionally convert to a pattern
+    const loadImg = (src, onload) => {
+      const img = new Image();
+      img.src = src;
+      img.onload = () => onload && onload(img);
+      img.onerror = () => {};
+      return img;
+    };
+
+    // Use root .webp assets the project provides
+    const asphaltImg = loadImg("road.webp", (img) => {
+      this.textures.asphalt = this.ctx.createPattern(img, "repeat");
+    });
+    this.textures.sidewalkImg = loadImg("sidewalk.webp");
+    const grassImg = loadImg("grass.webp", (img) => {
+      this.textures.grass = this.ctx.createPattern(img, "repeat");
+    });
+
+    this.textures.blueCar = loadImg("blue-car.webp");
+    this.textures.orangeCar = loadImg("orange-car.webp");
   }
 
   setInitialCarPosition() {
@@ -243,7 +286,7 @@ class ParkingGame {
     this.canvas.addEventListener("mouseleave", endDrag);
   }
 
-  updateCar() {
+  updateCar(dtSeconds) {
     // If we're in the win linger state, freeze car and wait for reset
     if (this.winResetAtMs !== null) {
       // Stop movement during the linger
@@ -263,33 +306,39 @@ class ParkingGame {
     if (this.keys.up) {
       this.car.lastDirection = 1;
       this.car.speed = Math.min(
-        this.car.speed + this.car.acceleration,
+        this.car.speed + this.car.acceleration * dtSeconds,
         this.car.maxSpeed
       );
     } else if (this.keys.down) {
       this.car.lastDirection = -1;
       this.car.speed = Math.max(
-        this.car.speed - this.car.acceleration,
+        this.car.speed - this.car.acceleration * dtSeconds,
         -this.car.maxSpeed
       );
     } else {
       // Apply friction
       if (this.car.speed > 0) {
-        this.car.speed = Math.max(0, this.car.speed - this.car.friction);
+        this.car.speed = Math.max(
+          0,
+          this.car.speed - this.car.friction * dtSeconds
+        );
       } else if (this.car.speed < 0) {
-        this.car.speed = Math.min(0, this.car.speed + this.car.friction);
+        this.car.speed = Math.min(
+          0,
+          this.car.speed + this.car.friction * dtSeconds
+        );
       }
     }
 
     // Handle steering (allow some steering when stationary)
     if (this.keys.left) {
       this.car.steerAngle = Math.max(
-        this.car.steerAngle - 0.02,
+        this.car.steerAngle - this.car.steerChangeRate * dtSeconds,
         -this.car.maxSteerAngle
       );
     } else if (this.keys.right) {
       this.car.steerAngle = Math.min(
-        this.car.steerAngle + 0.02,
+        this.car.steerAngle + this.car.steerChangeRate * dtSeconds,
         this.car.maxSteerAngle
       );
     } else {
@@ -303,12 +352,12 @@ class ParkingGame {
     ) {
       const turnRadius =
         this.car.wheelbase / Math.tan(Math.abs(this.car.steerAngle));
-      const angularVelocity = this.car.speed / turnRadius;
+      const angularVelocity = this.car.speed / turnRadius; // radians per second
 
       if (this.car.steerAngle > 0) {
-        this.car.angle += angularVelocity;
+        this.car.angle += angularVelocity * dtSeconds;
       } else {
-        this.car.angle -= angularVelocity;
+        this.car.angle -= angularVelocity * dtSeconds;
       }
     }
 
@@ -317,8 +366,8 @@ class ParkingGame {
     const prevY = this.car.y;
 
     // Update position
-    this.car.x += Math.cos(this.car.angle) * this.car.speed;
-    this.car.y += Math.sin(this.car.angle) * this.car.speed;
+    this.car.x += Math.cos(this.car.angle) * this.car.speed * dtSeconds;
+    this.car.y += Math.sin(this.car.angle) * this.car.speed * dtSeconds;
 
     // Check collisions
     if (this.checkCollisions()) {
@@ -327,6 +376,7 @@ class ParkingGame {
       this.car.y = prevY;
       this.car.speed = 0;
       this.car.collided = true;
+      this.collisionFlashUntilMs = Date.now() + this.collisionFlashDurationMs;
     } else {
       this.car.collided = false;
     }
@@ -587,9 +637,9 @@ class ParkingGame {
 
   drawParkingArea() {
     // Parking space outline
-    this.ctx.strokeStyle = "#ffd700";
     this.ctx.lineWidth = 3;
     this.ctx.setLineDash([10, 5]);
+    this.ctx.strokeStyle = "#ffd700";
     this.ctx.strokeRect(
       this.parkingSpace.x - this.parkingSpace.width / 2,
       this.parkingSpace.y - this.parkingSpace.height / 2,
@@ -598,16 +648,99 @@ class ParkingGame {
     );
     this.ctx.setLineDash([]);
 
-    // Parked cars
+    // Parked cars (textured sprites if available)
     this.parkedCars.forEach((car) => {
-      this.drawCar(car.x, car.y, car.angle, "#888", false);
+      if (this.textures.orangeCar && this.textures.orangeCar.complete) {
+        this.drawCarSprite(car.x, car.y, car.angle, this.textures.orangeCar);
+      } else {
+        this.drawCar(car.x, car.y, car.angle, "#888", false);
+      }
     });
 
-    // Curb centered horizontally relative to canvas, positioned below center
-    this.ctx.fillStyle = "#666";
+    // Bottom curb (below center)
     const curbLeft = this.centerX - this.curbWidth / 2;
-    const curbTop = this.centerY + this.curbOffsetY;
-    this.ctx.fillRect(curbLeft, curbTop, this.curbWidth, this.curbHeight);
+    const bottomCurbTop = this.centerY + this.curbOffsetY;
+    this.drawSidewalkStrip(
+      curbLeft,
+      bottomCurbTop,
+      this.curbWidth,
+      this.curbHeight
+    );
+
+    // Top curb (above center)
+    const topCurbTop = this.centerY - this.curbOffsetY - this.curbHeight;
+    this.drawSidewalkStrip(
+      curbLeft,
+      topCurbTop,
+      this.curbWidth,
+      this.curbHeight
+    );
+  }
+
+  drawSidewalkStrip(left, top, width, height) {
+    if (this.textures.sidewalkImg && this.textures.sidewalkImg.complete) {
+      const img = this.textures.sidewalkImg;
+      const srcW = img.naturalWidth || img.width;
+      const srcH = img.naturalHeight || img.height;
+      const destH = height;
+      const scale = destH / srcH;
+      const destWPerTile = srcW * scale;
+      let x = left;
+      while (x < left + width) {
+        const remaining = left + width - x;
+        const tileW = Math.min(destWPerTile, remaining);
+        const srcClipW = (tileW / destWPerTile) * srcW;
+        this.ctx.drawImage(img, 0, 0, srcClipW, srcH, x, top, tileW, destH);
+        x += tileW;
+      }
+    } else {
+      this.ctx.fillStyle = "#666";
+      this.ctx.fillRect(left, top, width, height);
+    }
+  }
+
+  drawCarSprite(x, y, angle, image) {
+    this.ctx.save();
+    this.ctx.translate(x, y);
+    this.ctx.rotate(angle + this.spriteAngleOffset);
+    // Preserve aspect ratio of the sprite; many car sprites are portrait
+    const srcW = image.naturalWidth || image.width || 1;
+    const srcH = image.naturalHeight || image.height || 1;
+    let targetW = this.car.width;
+    let targetH = this.car.height;
+    if (srcH > srcW) {
+      const tmp = targetW;
+      targetW = targetH;
+      targetH = tmp;
+    }
+    this.ctx.drawImage(image, -targetW / 2, -targetH / 2, targetW, targetH);
+    this.ctx.restore();
+  }
+
+  drawWheels(x, y, angle) {
+    this.ctx.save();
+    this.ctx.translate(x, y);
+    this.ctx.rotate(angle);
+    // Front wheels (steered)
+    this.ctx.save();
+    this.ctx.translate(this.car.width / 2 - 12, -15);
+    this.ctx.rotate(this.car.steerAngle);
+    this.ctx.fillStyle = "#222";
+    this.ctx.fillRect(-9, -4, 18, 8);
+    this.ctx.restore();
+
+    this.ctx.save();
+    this.ctx.translate(this.car.width / 2 - 12, 15);
+    this.ctx.rotate(this.car.steerAngle);
+    this.ctx.fillStyle = "#222";
+    this.ctx.fillRect(-9, -4, 18, 8);
+    this.ctx.restore();
+
+    // Rear wheels (fixed)
+    this.ctx.fillStyle = "#222";
+    this.ctx.fillRect(-this.car.width / 2 + 3, -15 - 4, 18, 8);
+    this.ctx.fillRect(-this.car.width / 2 + 3, 15 - 4, 18, 8);
+    this.ctx.restore();
   }
 
   checkParking() {
@@ -665,14 +798,27 @@ class ParkingGame {
     // Clear canvas
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
+    // Background with textures
+    this.drawBackground();
+
     // Draw parking area
     this.drawParkingArea();
 
     // Draw turning arc
     this.drawTurningArc();
 
-    // Draw player car
-    this.drawCar(this.car.x, this.car.y, this.car.angle);
+    // Draw player car (sprite if available, fallback to vector), then wheels on top
+    if (this.textures.blueCar && this.textures.blueCar.complete) {
+      this.drawCarSprite(
+        this.car.x,
+        this.car.y,
+        this.car.angle,
+        this.textures.blueCar
+      );
+      this.drawWheels(this.car.x, this.car.y, this.car.angle);
+    } else {
+      this.drawCar(this.car.x, this.car.y, this.car.angle);
+    }
 
     // Check parking success
     this.checkParking();
@@ -694,9 +840,20 @@ class ParkingGame {
       50
     );
 
+    // Level counter (based on winCount; starts at 1)
+    this.ctx.fillStyle = "#fff";
+    this.ctx.textAlign = "center";
+    this.ctx.fillText(`Level: ${this.winCount + 1}`, this.canvas.width / 2, 24);
+
     if (this.car.collided) {
       this.ctx.fillStyle = "#ff4444";
       this.ctx.fillText("COLLISION!", 10, 70);
+    }
+
+    // Collision flash overlay
+    if (Date.now() < this.collisionFlashUntilMs) {
+      this.ctx.fillStyle = "rgba(255, 68, 68, 0.25)";
+      this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     }
 
     // Debug overlays
@@ -751,6 +908,31 @@ class ParkingGame {
     }
   }
 
+  drawBackground() {
+    // Road (asphalt) as base layer
+    if (this.textures.asphalt) {
+      this.ctx.fillStyle = this.textures.asphalt;
+    } else {
+      this.ctx.fillStyle = "#555";
+    }
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    // Grass strips above top curb and below bottom curb
+    const bottomCurbTop = this.centerY + this.curbOffsetY;
+    const topCurbTop = this.centerY - this.curbOffsetY - this.curbHeight;
+    const grassFill = this.textures.grass ? this.textures.grass : "#3a6e22";
+    this.ctx.fillStyle = grassFill;
+    // Top grass
+    this.ctx.fillRect(0, 0, this.canvas.width, Math.max(0, topCurbTop));
+    // Bottom grass
+    this.ctx.fillRect(
+      0,
+      bottomCurbTop + this.curbHeight,
+      this.canvas.width,
+      Math.max(0, this.canvas.height - (bottomCurbTop + this.curbHeight))
+    );
+  }
+
   drawPoly(points, strokeStyle = "#00e5ff") {
     this.ctx.save();
     this.ctx.beginPath();
@@ -765,10 +947,23 @@ class ParkingGame {
     this.ctx.restore();
   }
 
-  gameLoop() {
-    this.updateCar();
+  gameLoop(timestampMs) {
+    if (typeof timestampMs !== "number") {
+      requestAnimationFrame((t) => this.gameLoop(t));
+      return;
+    }
+
+    if (this.lastFrameAtMs === null) {
+      this.lastFrameAtMs = timestampMs;
+    }
+    let dtSeconds = (timestampMs - this.lastFrameAtMs) / 1000;
+    this.lastFrameAtMs = timestampMs;
+    // Clamp dt to avoid huge jumps if tab was backgrounded
+    dtSeconds = Math.max(0, Math.min(dtSeconds, 0.05));
+
+    this.updateCar(dtSeconds);
     this.render();
-    requestAnimationFrame(() => this.gameLoop());
+    requestAnimationFrame((t) => this.gameLoop(t));
   }
 }
 
