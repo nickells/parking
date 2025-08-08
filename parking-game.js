@@ -22,6 +22,9 @@ class ParkingGame {
       maxSteerAngle: Math.PI / 6,
       wheelbase: 70,
       steerChangeRate: 0.8, // radians per second
+      // Shrink collision box to account for rounded sprite corners
+      collisionInsetX: 8,
+      collisionInsetY: 6,
       collided: false,
       lastDirection: 1, // 1 for forward, -1 for reverse
     };
@@ -42,6 +45,8 @@ class ParkingGame {
         width: 90,
         height: 45,
         angle: 0,
+        collisionInsetX: 8,
+        collisionInsetY: 6,
       },
       {
         x: this.centerX + 120,
@@ -49,6 +54,8 @@ class ParkingGame {
         width: 90,
         height: 45,
         angle: 0,
+        collisionInsetX: 8,
+        collisionInsetY: 6,
       },
     ];
 
@@ -397,19 +404,16 @@ class ParkingGame {
   }
 
   isPointerOnCar(px, py) {
-    const cx = this.car.x;
-    const cy = this.car.y;
-    const angle = this.car.angle;
-    const halfW = this.car.width / 2;
-    const halfH = this.car.height / 2;
-    const dx = px - cx;
-    const dy = py - cy;
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-    // Rotate point into car's local space (inverse rotation)
-    const localX = dx * cos + dy * sin;
-    const localY = -dx * sin + dy * cos;
-    return Math.abs(localX) <= halfW && Math.abs(localY) <= halfH;
+    const poly = this.getChamferedRectPolygon(
+      this.car.x,
+      this.car.y,
+      this.car.width,
+      this.car.height,
+      this.car.angle,
+      this.car.collisionInsetX || 0,
+      this.car.collisionInsetY || 0
+    );
+    return this.pointInPolygon(px, py, poly);
   }
 
   getTurningRadius() {
@@ -418,22 +422,27 @@ class ParkingGame {
   }
 
   checkCollisions() {
-    // Check collision with parked cars
+    // Check collision with parked cars using polygons
+    const playerPoly = this.getChamferedRectPolygon(
+      this.car.x,
+      this.car.y,
+      this.car.width,
+      this.car.height,
+      this.car.angle,
+      this.car.collisionInsetX || 0,
+      this.car.collisionInsetY || 0
+    );
     for (let parkedCar of this.parkedCars) {
-      if (
-        this.rectangleCollision(
-          this.car.x,
-          this.car.y,
-          this.car.width,
-          this.car.height,
-          this.car.angle,
-          parkedCar.x,
-          parkedCar.y,
-          parkedCar.width,
-          parkedCar.height,
-          parkedCar.angle
-        )
-      ) {
+      const npcPoly = this.getChamferedRectPolygon(
+        parkedCar.x,
+        parkedCar.y,
+        parkedCar.width,
+        parkedCar.height,
+        parkedCar.angle,
+        parkedCar.collisionInsetX || 0,
+        parkedCar.collisionInsetY || 0
+      );
+      if (this.polygonCollision(playerPoly, npcPoly)) {
         this.lastCollision = { type: "car", with: parkedCar };
         return true;
       }
@@ -447,20 +456,14 @@ class ParkingGame {
       height: this.curbHeight,
       angle: 0,
     };
-    if (
-      this.rectangleCollision(
-        this.car.x,
-        this.car.y,
-        this.car.width,
-        this.car.height,
-        this.car.angle,
-        curb.x,
-        curb.y,
-        curb.width,
-        curb.height,
-        curb.angle
-      )
-    ) {
+    const curbPoly = this.getRectangleCorners(
+      curb.x,
+      curb.y,
+      curb.width,
+      curb.height,
+      curb.angle
+    );
+    if (this.polygonCollision(playerPoly, curbPoly)) {
       this.lastCollision = { type: "curb", with: curb };
       return true;
     }
@@ -520,9 +523,7 @@ class ParkingGame {
       axisY /= length;
       axes.push({ x: axisX, y: axisY });
     }
-    // Use only two unique axes per rectangle (edges 0 and 1)
-    // to avoid duplicates due to the loop above
-    return [axes[0], axes[1]];
+    return axes;
   }
 
   projectPointsOnAxis(points, axis) {
@@ -534,6 +535,63 @@ class ParkingGame {
       if (projection > max) max = projection;
     }
     return [min, max];
+  }
+
+  // Octagonal polygon approximating a rounded-rectangle footprint
+  getChamferedRectPolygon(
+    cx,
+    cy,
+    width,
+    height,
+    angle,
+    insetX = 0,
+    insetY = 0
+  ) {
+    const halfW = width / 2;
+    const halfH = height / 2;
+    const ix = Math.min(Math.max(insetX, 0), Math.max(0, halfW - 1));
+    const iy = Math.min(Math.max(insetY, 0), Math.max(0, halfH - 1));
+    const local = [
+      { x: -halfW + ix, y: -halfH },
+      { x: halfW - ix, y: -halfH },
+      { x: halfW, y: -halfH + iy },
+      { x: halfW, y: halfH - iy },
+      { x: halfW - ix, y: halfH },
+      { x: -halfW + ix, y: halfH },
+      { x: -halfW, y: halfH - iy },
+      { x: -halfW, y: -halfH + iy },
+    ];
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    return local.map((p) => ({
+      x: cx + p.x * cos - p.y * sin,
+      y: cy + p.x * sin + p.y * cos,
+    }));
+  }
+
+  polygonCollision(pointsA, pointsB) {
+    const axes = [...this.getAxes(pointsA), ...this.getAxes(pointsB)];
+    for (const axis of axes) {
+      const [minA, maxA] = this.projectPointsOnAxis(pointsA, axis);
+      const [minB, maxB] = this.projectPointsOnAxis(pointsB, axis);
+      if (maxA < minB || maxB < minA) return false;
+    }
+    return true;
+  }
+
+  pointInPolygon(px, py, points) {
+    let inside = false;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const xi = points[i].x,
+        yi = points[i].y;
+      const xj = points[j].x,
+        yj = points[j].y;
+      const intersect =
+        yi > py !== yj > py &&
+        px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-12) + xi;
+      if (intersect) inside = !inside;
+    }
+    return inside;
   }
 
   drawCar(x, y, angle, color = "#4a90e2", showWheels = true) {
@@ -858,26 +916,30 @@ class ParkingGame {
 
     // Debug overlays
     if (this.debug) {
-      // Draw car rectangle
-      const carPts = this.getRectangleCorners(
+      // Draw player car collision polygon
+      const carPoly = this.getChamferedRectPolygon(
         this.car.x,
         this.car.y,
         this.car.width,
         this.car.height,
-        this.car.angle
+        this.car.angle,
+        this.car.collisionInsetX || 0,
+        this.car.collisionInsetY || 0
       );
-      this.drawPoly(carPts, "#00e5ff");
+      this.drawPoly(carPoly, "#00e5ff");
 
-      // Draw parked cars
+      // Draw parked car collision polygons
       for (const pc of this.parkedCars) {
-        const pcPts = this.getRectangleCorners(
+        const pcPoly = this.getChamferedRectPolygon(
           pc.x,
           pc.y,
           pc.width,
           pc.height,
-          pc.angle
+          pc.angle,
+          pc.collisionInsetX || 0,
+          pc.collisionInsetY || 0
         );
-        this.drawPoly(pcPts, "#ffcc00");
+        this.drawPoly(pcPoly, "#ffcc00");
       }
 
       // Draw curb rectangle
