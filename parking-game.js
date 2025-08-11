@@ -787,25 +787,13 @@ class ParkingGame {
       return;
     }
 
-    // Anchor near the arrow at the front center of the car
-    const halfW = this.car.width / 2;
-    const anchorOffset = halfW - 8; // small inset from the bumper where arrow tip sits
-    const anchorX = this.car.x + Math.cos(this.car.angle) * anchorOffset;
-    const anchorY = this.car.y + Math.sin(this.car.angle) * anchorOffset;
-
-    // Calculate turning circle for the ANCHOR point, not the rear axle.
-    // Bicycle model: R_rear = wheelbase / tan(delta). Any point s meters ahead of rear axle
-    // travels a circle of radius R_point = sqrt(R_rear^2 + s^2).
-    const sFromRearToCenter = this.car.wheelbase / 2;
-    const sFromCenterToAnchor = anchorOffset;
-    const sFromRearToAnchor = sFromRearToCenter + sFromCenterToAnchor;
-    const anchorRadius = Math.hypot(radius, sFromRearToAnchor);
-
-    // Arc center using perpendicular from the anchor by the anchor's radius
+    // Calculate the turning circle center based on the car's center
+    // The car's center follows a circle of radius R = wheelbase / tan(steerAngle)
+    // The center of this circle is perpendicular to the car's direction
     const perpAngle =
       this.car.angle + (this.car.steerAngle > 0 ? Math.PI / 2 : -Math.PI / 2);
-    const centerX = anchorX + Math.cos(perpAngle) * anchorRadius;
-    const centerY = anchorY + Math.sin(perpAngle) * anchorRadius;
+    const centerX = this.car.x + Math.cos(perpAngle) * radius;
+    const centerY = this.car.y + Math.sin(perpAngle) * radius;
 
     // Draw a full circle, but fade so only the segment near the car is visible
 
@@ -827,7 +815,7 @@ class ParkingGame {
     this.ctx.lineWidth = this.car.width / 2.4;
     this.ctx.setLineDash([5, 5]);
     this.ctx.beginPath();
-    this.ctx.arc(centerX, centerY, anchorRadius, 0, Math.PI * 2);
+    this.ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
     this.ctx.stroke();
     this.ctx.setLineDash([]);
   }
