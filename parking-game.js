@@ -17,7 +17,8 @@ class ParkingGame {
       speed: 0,
       maxSpeed: 360, // pixels per second
       acceleration: 100, // pixels per second^2
-      friction: 300, // pixels per second^2
+      friction: 400, // pixels per second^2
+      brakeDeceleration: 600, // stronger decel when switching direction (px/s^2)
       steerAngle: 0,
       maxSteerAngle: Math.PI / 6,
       wheelbase: 70,
@@ -101,6 +102,27 @@ class ParkingGame {
     this.debug = false;
     this.lastCollision = null;
 
+    // Tutorial state (data-driven)
+    this.tutorial = {
+      enabled: true,
+      stepIndex: 0,
+      completed: false,
+      dwellStartMs: null,
+      defaults: {
+        positionPx: 40,
+        angleRad: Math.PI / 6,
+        dwellMs: 350,
+      },
+      steps: [],
+    };
+    // Legacy flags kept for compatibility with existing UI gates
+    this.tutorialMode = this.tutorial.enabled;
+    this.tutorialCompleted = this.tutorial.completed;
+
+    // Tutorial target positions for each step (legacy array no longer used;
+    // kept around to avoid accidental references)
+    this.tutorialTargets = [];
+
     // Turning arc draws from front center near the arrow
     // Guide fade radius (controls visible extent of turning guides)
     this.turningGuideFadeRadius = 220;
@@ -113,6 +135,13 @@ class ParkingGame {
     // Initialize UI and layout
     this.initUI();
     this.recomputeParkingLayout();
+
+    // Show tutorial if enabled
+    // No persistence for tutorial enabled/hidden; always start enabled
+    this.tutorialMode = this.tutorial.enabled;
+    if (this.tutorial.enabled) {
+      this.updateTutorialStep();
+    }
 
     // Textures
     this.textures = {
@@ -135,43 +164,37 @@ class ParkingGame {
   }
 
   initUI() {
-    const panel = document.createElement("div");
-    panel.style.position = "fixed";
-    panel.style.top = "10px";
-    panel.style.left = "10px";
-    panel.style.zIndex = "1000";
-    panel.style.background = "rgba(255,255,255,0.9)";
-    panel.style.border = "1px solid #ddd";
-    panel.style.borderRadius = "8px";
-    panel.style.padding = "8px 12px";
-    panel.style.font = "14px Arial, sans-serif";
-    panel.style.color = "#222";
+    // Wire existing static HTML controls
+    const label = document.getElementById("gap-label");
+    const slider = document.getElementById("gap-slider");
+    const tutorialPanel = document.getElementById("tutorial-panel");
+    const tutorialText = document.getElementById("tutorial-text");
+    const tutorialSkip = document.getElementById("tutorial-skip");
 
-    const label = document.createElement("label");
-    label.textContent = `Gap: ${Math.round(this.gapBetweenCars)} px`;
-    label.style.display = "block";
-    label.style.marginBottom = "6px";
+    if (label) label.textContent = `Gap: ${Math.round(this.gapBetweenCars)} px`;
+    if (slider) {
+      slider.value = String(Math.round(this.gapBetweenCars));
+      slider.addEventListener("input", () => {
+        this.gapBetweenCars = Number(slider.value);
+        if (label)
+          label.textContent = `Gap: ${Math.round(this.gapBetweenCars)} px`;
+        this.recomputeParkingLayout();
+      });
+    }
 
-    const slider = document.createElement("input");
-    slider.type = "range";
-    slider.min = "60";
-    slider.max = "360";
-    slider.step = "10";
-    slider.value = String(Math.round(this.gapBetweenCars));
-    slider.style.width = "220px";
-    slider.addEventListener("input", () => {
-      this.gapBetweenCars = Number(slider.value);
-      label.textContent = `Gap: ${Math.round(this.gapBetweenCars)} px`;
-      this.recomputeParkingLayout();
-    });
-
-    panel.appendChild(label);
-    panel.appendChild(slider);
-    document.body.appendChild(panel);
+    if (tutorialSkip) {
+      tutorialSkip.addEventListener("click", () => {
+        this.tutorial.enabled = false;
+        this.tutorialMode = false;
+        if (tutorialPanel) tutorialPanel.style.display = "none";
+      });
+    }
 
     // Keep refs for programmatic updates
     this.gapLabel = label;
     this.gapSlider = slider;
+    this.tutorialPanel = tutorialPanel;
+    this.tutorialText = tutorialText;
   }
 
   recomputeParkingLayout() {
@@ -192,12 +215,122 @@ class ParkingGame {
     // Make the parking box span the inner gap
     this.parkingSpace.width = this.gapBetweenCars;
 
+    // Update tutorial targets based on new layout
+    this.updateTutorialTargets();
+
     // Update UI display if present
     if (this.gapLabel)
       this.gapLabel.textContent = `Gap: ${Math.round(this.gapBetweenCars)} px`;
     if (this.gapSlider)
       this.gapSlider.value = String(Math.round(this.gapBetweenCars));
   }
+
+  updateTutorialTargets() {
+    const laneY = this.parkingSpace.y;
+    const carWidth = this.car.width;
+    const carHeight = this.car.height;
+
+    // Build data-driven steps using live targets
+    this.tutorial.steps = [
+      {
+        id: "pull-up",
+        text: "Pull up next to the front car",
+        target: () => ({
+          x: this.parkedCars[1].x,
+          y: laneY - carHeight - 20,
+          angle: 0,
+        }),
+        thresholds: { positionPx: 10, angleRad: Math.PI / 8, dwellMs: 250 },
+        extraCheck: (g) => g.car.speed > 0,
+      },
+      {
+        id: "back-up",
+        text: "Back up a little bit!",
+        target: () => ({
+          x: this.parkedCars[1].x - 40,
+          y: laneY - carHeight - 20,
+          angle: 0,
+        }),
+        thresholds: { positionPx: 10, angleRad: Math.PI / 8, dwellMs: 250 },
+        // Consider reversing even if speed is near zero by using lastDirection
+        extraCheck: (g) => g.car.lastDirection === -1,
+      },
+      {
+        id: "turn-right",
+        text: "Turn your wheel all the way right",
+        target: () => ({
+          x: this.parkedCars[1].x - 40,
+          y: laneY - carHeight - 20,
+          angle: 0,
+        }),
+        thresholds: { positionPx: 10, angleRad: Math.PI / 8, dwellMs: 250 },
+        extraCheck: (g) => g.car.steerAngle > 0.5,
+      },
+      {
+        id: "reverse-45",
+        text: "Back up until your car is at ~45°",
+        target: () => ({
+          x: this.parkedCars[1].x - carWidth - 30,
+          y: laneY - 30,
+          angle: -Math.PI / 4,
+        }),
+        thresholds: { positionPx: 10, angleRad: Math.PI / 8, dwellMs: 250 },
+        extraCheck: (g) => g.car.speed < 0,
+      },
+      // {
+      //   id: "turn-left",
+      //   text: "Turn your wheel all the way left",
+      //   target: () => ({
+      //     x: this.parkedCars[1].x - carWidth - 30,
+      //     y: laneY - 30,
+      //     angle: -Math.PI / 4,
+      //   }),
+      //   thresholds: { positionPx: 60, angleRad: Math.PI / 4, dwellMs: 200 },
+      //   extraCheck: (g) => g.car.steerAngle < -0.5,
+      // },
+      {
+        id: "reverse-in",
+        text: "Turn your wheel to the left and keep backing into the space",
+        target: () => ({
+          x: this.parkingSpace.x - 35,
+          y: laneY,
+          angle: -Math.PI / 20,
+        }),
+        thresholds: { positionPx: 10, angleRad: Math.PI / 8, dwellMs: 250 },
+        extraCheck: (g) => g.car.speed < 0,
+      },
+      {
+        id: "straighten",
+        text: "Pull up and straigthen your wheels and stop.",
+        target: () => ({
+          x: this.parkingSpace.x,
+          y: this.parkingSpace.y,
+          angle: 0,
+        }),
+        thresholds: { positionPx: 10, angleRad: Math.PI / 8, dwellMs: 250 },
+        extraCheck: (g) =>
+          Math.abs(g.car.speed) < 0.1 && Math.abs(g.car.steerAngle) < 0.12,
+        onExit: () => {
+          this.tutorial.completed = true;
+          this.tutorialCompleted = true;
+        },
+      },
+    ];
+    // Keep legacy array synchronized for any draws referencing it
+    this.tutorialTargets = this.tutorial.steps.map((s) => {
+      const t = typeof s.target === "function" ? s.target(this) : s.target;
+      return {
+        x: t.x,
+        y: t.y,
+        angle: t.angle,
+        width: carWidth + 20,
+        height: carHeight + 20,
+      };
+    });
+  }
+
+  // Left empty intentionally; adjustment system removed per request
+  applyTutorialAdjustment() {}
 
   loadTextures() {
     // Helper to load an image and optionally convert to a pattern
@@ -233,6 +366,128 @@ class ParkingGame {
     this.car.steerAngle = 0;
     this.car.lastDirection = 1;
     this.car.angle = 0;
+  }
+
+  updateTutorialStep() {
+    if (!this.tutorial || !this.tutorial.enabled) {
+      this.tutorialPanel.style.display = "none";
+      return;
+    }
+    const step = this.tutorial.steps[this.tutorial.stepIndex];
+    if (!step) {
+      this.tutorialPanel.style.display = "none";
+      return;
+    }
+    this.tutorialPanel.style.display = "block";
+    this.tutorialText.textContent = step.text || "";
+    this.tutorial.dwellStartMs = null;
+    if (typeof step.onEnter === "function") step.onEnter(this);
+  }
+
+  checkTutorialProgress() {
+    const tut = this.tutorial;
+    if (!tut || !tut.enabled || tut.completed) return;
+
+    const step = tut.steps[tut.stepIndex];
+    if (!step) return;
+
+    const target =
+      typeof step.target === "function" ? step.target(this) : step.target;
+    if (!target) return;
+
+    const positionThreshold =
+      step.thresholds?.positionPx ?? tut.defaults.positionPx;
+    const angleThreshold = step.thresholds?.angleRad ?? tut.defaults.angleRad;
+    const dwellMs = step.thresholds?.dwellMs ?? tut.defaults.dwellMs;
+
+    const carAng = this.wrapAngle(this.car.angle);
+    const targetAng = this.wrapAngle(target.angle || 0);
+    const dist = Math.hypot(this.car.x - target.x, this.car.y - target.y);
+    const aDelta = this.angleDiff(carAng, targetAng);
+
+    const meetsBase = dist <= positionThreshold && aDelta <= angleThreshold;
+    const meetsExtra =
+      typeof step.extraCheck === "function" ? step.extraCheck(this) : true;
+    const inTarget = meetsBase && meetsExtra;
+
+    const now = Date.now();
+    if (inTarget) {
+      if (tut.dwellStartMs === null) tut.dwellStartMs = now;
+      if (now - tut.dwellStartMs >= dwellMs) {
+        if (typeof step.onExit === "function") step.onExit(this);
+        tut.stepIndex += 1;
+        if (tut.stepIndex >= tut.steps.length) {
+          tut.completed = true;
+          this.tutorialCompleted = true;
+          this.tutorialPanel.style.display = "none";
+        } else {
+          this.updateTutorialStep();
+        }
+      }
+    } else {
+      tut.dwellStartMs = null;
+    }
+  }
+
+  // Angle helpers
+  wrapAngle(rad) {
+    let a = rad % (Math.PI * 2);
+    if (a < 0) a += Math.PI * 2;
+    return a;
+  }
+
+  angleDiff(a, b) {
+    const raw = Math.abs(a - b);
+    return Math.min(raw, Math.PI * 2 - raw);
+  }
+
+  drawTutorialTarget() {
+    if (!this.tutorial || !this.tutorial.enabled || this.tutorial.completed) {
+      return;
+    }
+
+    const step = this.tutorial.steps[this.tutorial.stepIndex];
+    if (!step) return;
+    const t =
+      typeof step.target === "function" ? step.target(this) : step.target;
+    if (!t) return;
+
+    this.ctx.save();
+    this.ctx.translate(t.x, t.y);
+    this.ctx.rotate(t.angle);
+
+    // Draw target box with animated border
+    const time = Date.now() * 0.005;
+    const alpha = 0.3 + 0.2 * Math.sin(time);
+
+    this.ctx.strokeStyle = `rgba(74, 222, 128, ${alpha})`;
+    this.ctx.lineWidth = 3;
+    this.ctx.setLineDash([8, 4]);
+    const w = this.car.width + 20;
+    const h = this.car.height + 20;
+    this.ctx.strokeRect(-w / 2, -h / 2, w, h);
+    this.ctx.setLineDash([]);
+
+    this.ctx.restore();
+
+    // When debug is on, draw all tutorial targets for quick visual tweaking
+    if (this.debug && this.tutorial && this.tutorial.steps) {
+      for (const s of this.tutorial.steps) {
+        const tt = typeof s.target === "function" ? s.target(this) : s.target;
+        if (!tt) continue;
+        this.ctx.save();
+        this.ctx.translate(tt.x, tt.y);
+        this.ctx.rotate(tt.angle || 0);
+        this.ctx.strokeStyle = "rgba(255, 204, 0, 0.9)"; // yellow
+        this.ctx.lineWidth = 2;
+        this.ctx.setLineDash([6, 4]);
+        const ww = this.car.width + 20;
+        const hh = this.car.height + 20;
+        this.ctx.strokeRect(-ww / 2, -hh / 2, ww, hh);
+        this.ctx.restore();
+      }
+      this.ctx.setLineDash([]);
+    }
   }
 
   setupEventListeners() {
@@ -322,21 +577,36 @@ class ParkingGame {
       this.car.collided = false;
       return;
     }
-    // Handle acceleration
-    if (this.keys.up) {
-      this.car.lastDirection = 1;
-      this.car.speed = Math.min(
-        this.car.speed + this.car.acceleration * dtSeconds,
-        this.car.maxSpeed
-      );
-    } else if (this.keys.down) {
-      this.car.lastDirection = -1;
-      this.car.speed = Math.max(
-        this.car.speed - this.car.acceleration * dtSeconds,
-        -this.car.maxSpeed
-      );
+    // Handle acceleration with soft braking when switching directions
+    const pressedForward = !!this.keys.up;
+    const pressedReverse = !!this.keys.down;
+    if (pressedForward || pressedReverse) {
+      const desiredDir = pressedForward ? 1 : -1;
+      const currentDir = Math.sign(this.car.speed);
+      // If attempting to move opposite current motion, apply strong braking toward 0 first
+      if (currentDir !== 0 && currentDir !== desiredDir) {
+        const brake = this.car.brakeDeceleration * dtSeconds;
+        if (currentDir > 0) {
+          this.car.speed = Math.max(0, this.car.speed - brake);
+        } else {
+          this.car.speed = Math.min(0, this.car.speed + brake);
+        }
+      }
+      // Only accelerate in desired direction once we've reached (or crossed) zero
+      const canAccelerate =
+        Math.sign(this.car.speed) === 0 ||
+        Math.sign(this.car.speed) === desiredDir;
+      if (canAccelerate) {
+        this.car.lastDirection = desiredDir;
+        this.car.speed += desiredDir * this.car.acceleration * dtSeconds;
+      }
+      // Clamp speed
+      if (this.car.speed > this.car.maxSpeed)
+        this.car.speed = this.car.maxSpeed;
+      if (this.car.speed < -this.car.maxSpeed)
+        this.car.speed = -this.car.maxSpeed;
     } else {
-      // Apply friction
+      // Apply friction when no throttle
       if (this.car.speed > 0) {
         this.car.speed = Math.max(
           0,
@@ -974,11 +1244,15 @@ class ParkingGame {
       this.car.y > this.parkingSpace.y - this.parkingSpace.height / 2 &&
       this.car.y < this.parkingSpace.y + this.parkingSpace.height / 2;
 
-    const wellAligned =
-      Math.abs(this.car.angle % (Math.PI * 2)) < 0.2 ||
-      Math.abs((this.car.angle % (Math.PI * 2)) - Math.PI * 2) < 0.2;
+    // Require car orientation and steer to be within thresholds
+    const angleThreshold = Math.PI / 36; // ~5 degrees
+    const steerThreshold = Math.PI / 36; // ~5 degrees
+    const wrappedAngle = this.wrapAngle(this.car.angle);
+    const aligned = this.angleDiff(wrappedAngle, 0) <= angleThreshold;
+    const wheelsStraight = Math.abs(this.car.steerAngle) <= steerThreshold;
+    const stopped = Math.abs(this.car.speed) < 0.1;
 
-    if (inSpace && wellAligned && Math.abs(this.car.speed) < 0.1) {
+    if (inSpace && aligned && wheelsStraight && stopped) {
       this.ctx.fillStyle = "rgba(76, 222, 128, 0.3)";
       this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
@@ -1030,6 +1304,9 @@ class ParkingGame {
 
     // Draw turning arc
     this.drawTurningArc();
+
+    // Draw tutorial target (before car so it appears behind)
+    this.drawTutorialTarget();
 
     // Draw player car (sprite if available, fallback to vector), then wheels on top
     if (this.textures.blueCar && this.textures.blueCar.complete) {
@@ -1180,6 +1457,7 @@ class ParkingGame {
     dtSeconds = Math.max(0, Math.min(dtSeconds, 0.05));
 
     this.updateCar(dtSeconds);
+    this.checkTutorialProgress();
     this.render();
     requestAnimationFrame((t) => this.gameLoop(t));
   }
